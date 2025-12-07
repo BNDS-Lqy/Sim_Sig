@@ -20,7 +20,7 @@ plt.rcParams['axes.unicode_minus'] = False
 N_0 = 10 ** ((-174 - 30) / 10)  # 噪声功率谱密度 (W/Hz)
 L_0 = 70  # 参考路径损耗 (dB)
 GRID_SIZE = 200  # 网格精度
-MAX_DISTANCE = 2000  # 最大模拟距离 (m)
+MAX_DISTANCE = 200  # 最大模拟距离 (m)
 MIN_DISTANCE = 1  # 最小计算距离 (m)
 COLORBAR_MIN = 0  # 速率下限
 # 比例公平算法参数
@@ -36,6 +36,9 @@ AVG_SPEED = 30.0  # 平均网速阈值(Mbps)
 MACRO_BS_COST = 50.0  # 宏基站单价(万元)
 MICRO_BS_COST = 10.0  # 微基站单价(万元)
 MAX_COST = 500.0  # 最大总成本(万元)
+
+#查询函数用区：load _get_blind Gaoptimizer vital from_csv
+
 # 基站参数配置
 bs_type_config = {
     '宏基站': {
@@ -77,7 +80,7 @@ MACRO_MUTATE_RATIO = 0.6  # 从0.3提升到0.6（宏基站位置变异率翻倍�
 MICRO_POS_STEP = 0.6  # 从0.3提升到0.6（微基站移动幅度翻倍）
 MACRO_POS_STEP = 0.5  # 从0.2提升到0.5（宏基站移动幅度翻倍）
 GA_POP_SIZE = 50  # 从50提升到100（种群多样性提升）
-GA_MAX_ITER = 10  # 从50提升到200（迭代次数翻倍，充分探索）
+GA_MAX_ITER = 60  # 从50提升到200（迭代次数翻倍，充分探索）
 
 
 # ============================ 核心计算函数 =============================
@@ -232,34 +235,41 @@ def generate_users(num_users=100, area_range=(0, MAX_DISTANCE)):
 
 
 def load_users_from_csv(csv_path):
-    """从CSV文件加载用户数据，添加微小偏移避免速率同质化"""
+    """无表头CSV的解析逻辑（列索引：0=区域编号，1=实际X，2=实际Y）"""
     users = []
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
         lines = f.readlines()
-        data_lines = []
-        for line in lines:
+        for line_idx, line in enumerate(lines):
             line = line.strip()
-            if line and not line.startswith('#'):
-                data_lines.append(line)
-        # 解析数据行
-        for i, line in enumerate(data_lines):
+            if not line or line.startswith('#'):
+                continue  # 跳过空行/注释行
             parts = line.split(',')
-            if len(parts) >= 2:
-                try:
-                    x = float(parts[0])
-                    y = float(parts[1])
-                    users.append({
-                        'id': i, 'x': x, 'y': y,
-                        'instant_speed': 0.0, 'avg_speed': 0.0, 'pf_speed': 0.0
-                    })
-                except ValueError:
-                    continue
-    # 关键修正：添加±1m随机偏移，确保用户坐标存在差异（符合论文多用户信道差异假设）
-    np.random.seed(42)  # 固定种子保证可复现
-    for user in users:
-        user['x'] += np.random.uniform(-1.0, 1.0)
-        user['y'] += np.random.uniform(-1.0, 1.0)
-    print(f"✅ 从{csv_path}加载{len(users)}个用户（已添加坐标偏移）")
+            if len(parts) < 3:  # 至少需要区域编号、实际X、实际Y三列
+                print(f"⚠️ 跳过第{line_idx+1}行：列数不足（仅{len(parts)}列）")
+                continue
+            try:
+                # 按列索引读取：1=实际X坐标，2=实际Y坐标
+                x = float(parts[1])
+                y = float(parts[2])
+                x = np.clip(x, 0, MAX_DISTANCE)
+                y = np.clip(y, 0, MAX_DISTANCE)
+                x += np.random.uniform(-0.1, 0.1)
+                y += np.random.uniform(-0.1, 0.1)
+                # 完整字典（无...）
+                users.append({
+                    'id': line_idx,
+                    'x': x,
+                    'y': y,
+                    'instant_speed': 0.0,
+                    'avg_speed': 0.0,
+                    'pf_speed': 0.0
+                })
+            except ValueError:
+                print(f"⚠️ 跳过第{line_idx+1}行：坐标不是有效数字")
+                continue
+    if len(users) == 0:
+        raise ValueError(f"❌ 从{csv_path}加载不到有效用户数据！")
+    print(f"✅ 加载{len(users)}个用户，坐标范围：X[{min(u['x'] for u in users):.2f}, {max(u['x'] for u in users):.2f}]m，Y[{min(u['y'] for u in users):.2f}, {max(u['y'] for u in users):.2f}]m")
     return users
 
 
@@ -432,7 +442,7 @@ def identify_low_speed_areas(users, base_stations):
                 continue  # 无用户的网格跳过
             # 计算网格平均速率
             grid_avg_speed = np.mean(user_speeds[in_grid])
-            if grid_avg_speed < MIN_SPEED:  # 低于最低速率阈值则标记为盲区
+            if grid_avg_speed < AVG_SPEED:  # 低于最低速率阈值则标记为盲区
                 grid_center_x = (x_min + x_max) / 2
                 grid_center_y = (y_min + y_max) / 2
                 grid_area = GRID_CELL_SIZE ** 2
@@ -624,19 +634,28 @@ class GAOptimizer:
         self.best_bs = self.init_bs
 
     def _get_blind_areas(self, base_stations):
-        """获取速率盲区的中心坐标（用于定向变异）"""
+        """获取速率盲区的中心坐标（用于定向变异）+ 限制在模拟范围"""
         users = update_all_users_pf_speed(self.users, base_stations)
         blind_users = [u for u in users if u['pf_speed'] < MIN_SPEED]
         if not blind_users:
             return [(np.random.uniform(0, MAX_DISTANCE), np.random.uniform(0, MAX_DISTANCE))]
         blind_x = [u['x'] for u in blind_users]
         blind_y = [u['y'] for u in blind_users]
-        blind_coords = np.array([[x, y] for x, y in zip(blind_x, blind_y)])
+        # 核心修正：裁剪盲区中心坐标到模拟范围
+        blind_center_x = np.clip(np.mean(blind_x), 0, MAX_DISTANCE)
+        blind_center_y = np.clip(np.mean(blind_y), 0, MAX_DISTANCE)
+        blind_coords = np.array([[blind_center_x, blind_center_y]])
         if len(blind_coords) <= 3:
-            return [(np.mean(blind_x), np.mean(blind_y))]
+            return [(blind_center_x, blind_center_y)]
         kmeans = KMeans(n_clusters=min(3, len(blind_coords)), random_state=42)
         kmeans.fit(blind_coords)
-        return [(center[0], center[1]) for center in kmeans.cluster_centers_]
+        # 裁剪聚类后的中心坐标
+        centers = []
+        for center in kmeans.cluster_centers_:
+            cx = np.clip(center[0], 0, MAX_DISTANCE)
+            cy = np.clip(center[1], 0, MAX_DISTANCE)
+            centers.append((cx, cy))
+        return centers
 
     def _encode(self, base_stations):
         """
@@ -690,7 +709,7 @@ class GAOptimizer:
         return np.array(macro_code + micro_code, dtype=np.float32)
 
     def _decode(self, chrom):
-        """解码函数（支持宏基站新增+位置调整）"""
+        """解码函数（支持宏基站新增+位置调整）+ 强化坐标约束 + 修复n_value未定义"""
         base_stations = []
         # 计算编码维度
         macro_dim = self.total_macro_slot * 6
@@ -700,11 +719,14 @@ class GAOptimizer:
         macro_config = bs_type_config['宏基站']
         p_min, p_max = macro_config['P_t_range']
         b_min, b_max = macro_config['B_range']
-        n_value = macro_config['n_value']
+        n_value = macro_config['n_value']  # 核心修复：提前定义宏基站的n_value
         for i in range(self.total_macro_slot):
             idx = i * 6
             x = macro_code[idx] * MAX_DISTANCE
             y = macro_code[idx + 1] * MAX_DISTANCE
+            # 核心修正：解码后再次裁剪
+            x = np.clip(x, 0, MAX_DISTANCE)
+            y = np.clip(y, 0, MAX_DISTANCE)
             P_t = macro_code[idx + 2] * (p_max - p_min) + p_min
             B = macro_code[idx + 3] * (b_max - b_min) + b_min
             active = 1 if macro_code[idx + 4] > 0.5 else 0  # 激活位阈值
@@ -713,21 +735,27 @@ class GAOptimizer:
                 macro_bs = create_base_station('宏基站', x, y, active)
                 macro_bs['P_t'] = P_t
                 macro_bs['B'] = B
-                macro_bs['n'] = n_value
+                macro_bs['n'] = n_value  # 现在n_value已定义，不会报错
                 # 位置约束调整
                 if len(base_stations) > 0:
                     macro_bs = adjust_bs_position_to_constraint(macro_bs, base_stations)
+                # 最终裁剪（双重保险）
+                macro_bs['x'] = np.clip(macro_bs['x'], 0, MAX_DISTANCE)
+                macro_bs['y'] = np.clip(macro_bs['y'], 0, MAX_DISTANCE)
                 base_stations.append(macro_bs)
-        # 解码微基站
+        # 解码微基站（同步检查n_value定义）
         micro_code = chrom[macro_dim:macro_dim + micro_dim]
         micro_config = bs_type_config['微基站']
         p_min, p_max = micro_config['P_t_range']
         b_min, b_max = micro_config['B_range']
-        n_value = micro_config['n_value']
+        n_value = micro_config['n_value']  # 同步修复：定义微基站的n_value
         for i in range(self.total_micro_slot):
             idx = i * 6
             x = micro_code[idx] * MAX_DISTANCE
             y = micro_code[idx + 1] * MAX_DISTANCE
+            # 核心修正：解码后裁剪
+            x = np.clip(x, 0, MAX_DISTANCE)
+            y = np.clip(y, 0, MAX_DISTANCE)
             P_t = micro_code[idx + 2] * (p_max - p_min) + p_min
             B = micro_code[idx + 3] * (b_max - b_min) + b_min
             active = 1 if micro_code[idx + 4] > 0.5 else 0  # 激活位阈值
@@ -736,10 +764,13 @@ class GAOptimizer:
                 micro_bs = create_base_station('微基站', x, y, active)
                 micro_bs['P_t'] = P_t
                 micro_bs['B'] = B
-                micro_bs['n'] = n_value
+                micro_bs['n'] = n_value  # 微基站n_value已定义
                 # 位置约束调整
                 if len(base_stations) > 0:
                     micro_bs = adjust_bs_position_to_constraint(micro_bs, base_stations)
+                # 最终裁剪（双重保险）
+                micro_bs['x'] = np.clip(micro_bs['x'], 0, MAX_DISTANCE)
+                micro_bs['y'] = np.clip(micro_bs['y'], 0, MAX_DISTANCE)
                 base_stations.append(micro_bs)
         # 最终校验距离约束，过滤无效基站
         base_stations = check_bs_distance_constraint(base_stations)
@@ -905,7 +936,7 @@ class GAOptimizer:
 
 # ============================ 可视化模块（完整修复版）============================
 def visualize_results(users, greedy_bs, optimal_bs, ga_optimizer=None):
-    """可视化结果：修复箭头绘制、图例重复等bug，强化宏基站变化展示"""
+    """可视化结果：修复箭头绘制、图例重复等bug，强化宏基站变化展示 + 统一坐标范围"""
     greedy_eval = evaluate_deployment(users, greedy_bs)
     optimal_eval = evaluate_deployment(users, optimal_bs)
     greedy_r = greedy_eval['pf_speeds']
@@ -921,7 +952,7 @@ def visualize_results(users, greedy_bs, optimal_bs, ga_optimizer=None):
     fig.suptitle(
         f'5G基站排布优化结果（GA迭代{GA_MAX_ITER}次）| 贪心Score={greedy_score:.2f} → GA Score={optimal_score:.2f}',
         fontsize=18, fontweight='bold', y=0.98)
-    # 子图1：贪心部署 - 用户/基站分布
+    # 子图1：贪心部署 - 用户/基站分布（强制坐标范围）
     ax1 = axes[0, 0]
     user_x = [u['x'] for u in users]
     user_y = [u['y'] for u in users]
@@ -941,25 +972,16 @@ def visualize_results(users, greedy_bs, optimal_bs, ga_optimizer=None):
     ax1.legend(fontsize=10, loc='upper right')
     plt.colorbar(scatter1, ax=ax1, label='用户PF速率 (Mbps)', shrink=0.8)
     ax1.grid(alpha=0.3, linestyle='--')
-    # 设置坐标范围
-    all_x = [u['x'] for u in users] + [bs['x'] for bs in greedy_bs]
-    all_y = [u['y'] for u in users] + [bs['y'] for bs in greedy_bs]
-    min_x, max_x = min(all_x), max(all_x)
-    min_y, max_y = min(all_y), max(all_y)
-    x_margin = (max_x - min_x) * 0.1
-    y_margin = (max_y - min_y) * 0.1
-    ax1.set_xlim(min_x - x_margin, max_x + x_margin)
-    ax1.set_ylim(min_y - y_margin, max_y + y_margin)
+    # 核心修正：强制坐标范围为模拟范围 [0, MAX_DISTANCE]
+    ax1.set_xlim(0, MAX_DISTANCE)
+    ax1.set_ylim(0, MAX_DISTANCE)
 
-    # 子图2：GA优化部署 - 速率热力图+基站位置变化
+    # 子图2：GA优化部署 - 速率热力图+基站位置变化（统一坐标范围）
     ax2 = axes[0, 1]
-    # 生成速率热力图（优化网格大小，提升绘制效率）
+    # 生成速率热力图（基于模拟范围，而非用户坐标）
     grid_size = 40
-    # 使用实际坐标范围
-    x_min, x_max = min(all_x), max(all_x)
-    y_min, y_max = min(all_y), max(all_y)
-    x_grid = np.linspace(x_min, x_max, grid_size)
-    y_grid = np.linspace(y_min, y_max, grid_size)
+    x_grid = np.linspace(0, MAX_DISTANCE, grid_size)
+    y_grid = np.linspace(0, MAX_DISTANCE, grid_size)
     X, Y = np.meshgrid(x_grid, y_grid)
     Z = np.zeros_like(X)
     dummy_user = {'x': 0, 'y': 0, 'instant_speed': 0, 'avg_speed': 0, 'pf_speed': 0}
@@ -968,8 +990,10 @@ def visualize_results(users, greedy_bs, optimal_bs, ga_optimizer=None):
             dummy_user['x'] = X[i, j]
             dummy_user['y'] = Y[i, j]
             Z[i, j] = calculate_user_instant_speed(dummy_user['x'], dummy_user['y'], optimal_bs)
-    # 绘制热力图
-    contour = ax2.contourf(X, Y, Z, cmap='plasma', levels=25, antialiased=True, alpha=0.9)
+    # 绘制热力图（降低透明度，避免覆盖用户/基站）
+    contour = ax2.contourf(X, Y, Z, cmap='plasma', levels=25, antialiased=True, alpha=0.6)
+    # 绘制用户点（GA优化后的速率）
+    ax2.scatter(user_x, user_y, c=optimal_r, cmap='viridis', s=60, alpha=0.8, label='用户')
     # 绘制GA优化后的基站
     macro_x_o = [bs['x'] for bs in optimal_bs if bs['type_name'] == '宏基站']
     macro_y_o = [bs['y'] for bs in optimal_bs if bs['type_name'] == '宏基站']
@@ -979,19 +1003,25 @@ def visualize_results(users, greedy_bs, optimal_bs, ga_optimizer=None):
                 label=f'宏基站（{optimal_macro}个）')
     ax2.scatter(micro_x_o, micro_y_o, c='orange', s=180, marker='s', edgecolors='black', linewidth=2,
                 label=f'微基站（{optimal_micro}个）')
-    # 绘制宏基站位置变化箭头（贪心→GA）
+    # 绘制宏基站位置变化箭头（修复图例重复）
     min_macro = min(len(macro_x_g), len(macro_x_o))
+    arrow_label = '宏基站移动'
     for i in range(min_macro):
         ax2.arrow(macro_x_g[i], macro_y_g[i], macro_x_o[i] - macro_x_g[i], macro_y_o[i] - macro_y_g[i],
-                  head_width=20, head_length=30, fc='lime', ec='darkgreen', linewidth=2, alpha=0.8, label='宏基站移动' if i == 0 else "")
+                  head_width=5, head_length=8, fc='lime', ec='darkgreen', linewidth=2, alpha=0.8,
+                  label=arrow_label if i == 0 else "")
+        arrow_label = ""  # 仅第一个箭头显示图例
     ax2.set_xlabel('X坐标 (m)', fontsize=12)
     ax2.set_ylabel('Y坐标 (m)', fontsize=12)
     ax2.set_title(f'GA优化部署结果（速率热力图）', fontsize=14, fontweight='bold')
     ax2.legend(fontsize=10, loc='upper right')
     plt.colorbar(contour, ax=ax2, label='速率热力 (Mbps)', shrink=0.8)
     ax2.grid(alpha=0.3, linestyle='--')
+    # 核心修正：强制坐标范围为模拟范围
+    ax2.set_xlim(0, MAX_DISTANCE)
+    ax2.set_ylim(0, MAX_DISTANCE)
 
-    # 子图3：GA迭代Score进化曲线
+    # 子图3：GA迭代Score进化曲线（无修改）
     ax3 = axes[1, 0]
     if ga_optimizer and len(ga_optimizer.score_history) > 0:
         iterations = range(len(ga_optimizer.score_history))
@@ -1010,7 +1040,7 @@ def visualize_results(users, greedy_bs, optimal_bs, ga_optimizer=None):
         ax3.set_ylabel('评价Score', fontsize=12)
         ax3.set_title('GA优化Score进化曲线', fontsize=14, fontweight='bold')
 
-    # 子图4：贪心vs GA速率分布箱线图
+    # 子图4：贪心vs GA速率分布箱线图（无修改）
     ax4 = axes[1, 1]
     data = [greedy_r, optimal_r]
     labels = [f'贪心算法\n(均值{np.mean(greedy_r):.2f}Mbps)', f'GA优化\n(均值{np.mean(optimal_r):.2f}Mbps)']
@@ -1039,7 +1069,7 @@ def main():
     print("🚀 5G基站智能部署优化系统启动")
     print("=" * 60)
     # 1. 生成用户数据（可替换为load_users_from_csv("user_data.csv")）
-    users = load_users_from_csv(r"C:\Users\Lenovo\Desktop\多区域独立生点结果_20251124_204323_for_optimization.csv")
+    users = load_users_from_csv(r"C:\Users\Lenovo\Desktop\多区域独立生点结果_20251124_204323.csv")
     # 2. 贪心算法部署基站
     greedy_bs = greedy_deploy_base_stations(users, init_macro_num=INIT_MACRO_NUM)
     # 3. GA算法优化基站部署
@@ -1058,8 +1088,29 @@ def main():
     print(f"Score提升：{(final_ga['score'] - final_greedy['score']) / max(final_greedy['score'], EPS) * 100:.2f}%")
     print("=" * 60)
 
+    # 6. 输出基站详细信息到result.txt
+    def output_base_stations_to_file(greedy_bs, optimal_bs, filename="result.txt"):
+        """将基站详细信息输出到文本文件"""
+        with open(filename, "w", encoding="utf-8") as f:  # 使用写入模式打开文件 [[1]]
+            # 贪心算法部署的基站
+            f.write("# 贪心算法部署的基站\n")
+            f.write("类型,X坐标,Y坐标,ID,功率(dBm),带宽(MHz)\n")
+            for bs in greedy_bs:
+                # 使用f-string格式化输出 [[2]]
+                f.write(
+                    f"{bs['type_name']},{bs['x']:.2f},{bs['y']:.2f},{bs['id']},{10 * np.log10(bs['P_t'] * 1000):.2f},{bs['B']:.2f}\n")
+
+            f.write("\n# GA优化后的基站\n")
+            f.write("类型,X坐标,Y坐标,ID,功率(dBm),带宽(MHz)\n")
+            for bs in optimal_bs:
+                f.write(
+                    f"{bs['type_name']},{bs['x']:.2f},{bs['y']:.2f},{bs['id']},{10 * np.log10(bs['P_t'] * 1000):.2f},{bs['B']:.2f}\n")
+
+        print(f"\n✅ 基站详细信息已输出到 {filename}")
+
+    # 调用输出函数
+    output_base_stations_to_file(greedy_bs, optimal_bs)
+
 
 if __name__ == "__main__":
     main()
-
-    generate
